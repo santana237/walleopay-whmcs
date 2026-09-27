@@ -7,7 +7,9 @@
  *   1. signature HMAC vérifiée avec hash_equals(),
  *   2. horodatage « t= » de moins de 300 secondes,
  *   3. re-interrogation de GET /payments/{id} — seul « succeeded » est accepté,
- *   4. contrôle du montant et de la devise face à la facture WHMCS,
+ *   4. contrôle du montant et de la devise face à la facture WHMCS — la
+ *      commission, quand le client la paie, est mise de côté avant de
+ *      comparer (voir walleopay_cb_settledAmount()),
  *   5. checkCbInvoiceID() / checkCbTransID() puis addInvoicePayment().
  *
  * Compatible PHP 7.4+, aucune dépendance Composer.
@@ -87,9 +89,12 @@ $event = isset($payload['event']) ? (string) $payload['event'] : '';
 $notified = $payload['data'];
 $paymentId = isset($notified['id']) ? (string) $notified['id'] : '';
 
-// Les événements de versement ne concernent aucune facture.
-if (strpos($event, 'payout.') === 0) {
-    walleopay_cb_respond(200, 'ignored', 'Événement de versement ignoré.');
+// Seuls les événements de paiement concernent une facture. Reversements et
+// remboursements partent vers l'URL de notification par défaut du compte :
+// si c'est celle-ci, ils arrivent ici, et les relire comme des paiements
+// ferait échouer la vérification, puis rejouer la notification pour rien.
+if ($event !== '' && strpos($event, 'payment.') !== 0) {
+    walleopay_cb_respond(200, 'ignored', 'Événement « ' . $event . ' » ignoré : il ne concerne aucune facture.');
 }
 
 if ($paymentId === '') {
@@ -170,13 +175,16 @@ if ($invoice === null) {
 // le montant WHMCS avant de comparer.
 $expectedTotal = (int) round($invoice['total']);
 $expectedBalance = (int) round($invoice['balance']);
+$settled = walleopay_cb_settledAmount($payment, array($expectedTotal, $expectedBalance));
 
-if ($paidAmount !== $expectedTotal && $paidAmount !== $expectedBalance) {
+if ($settled === null) {
+    $paidFee = isset($payment['fee']) ? (int) $payment['fee'] : 0;
+
     walleopay_cb_log(
         $gatewayParams,
         $payment,
-        'Montant incohérent : ' . $paidAmount . ' reçu, ' . $expectedTotal
-        . ' (total) ou ' . $expectedBalance . ' (solde) attendus pour la facture #' . $invoiceId,
+        'Montant incohérent : ' . $paidAmount . ' reçu (dont ' . $paidFee . ' de commission), '
+        . $expectedTotal . ' (total) ou ' . $expectedBalance . ' (solde) attendus pour la facture #' . $invoiceId,
         'Unsuccessful'
     );
     walleopay_cb_respond(400, 'amount_mismatch', 'Montant incohérent avec la facture.');
@@ -199,9 +207,18 @@ if ($invoice['currency'] !== '' && $paidCurrency !== '' && $invoice['currency'] 
 $invoiceId = checkCbInvoiceID($invoiceId, $gatewayParams['name']);
 checkCbTransID($transactionId);
 
-$fee = isset($payment['fee']) ? (float) $payment['fee'] : 0.0;
+/*
+ * La facture est créditée de ce qu'elle réclamait, jamais davantage : quand
+ * le client a payé la commission, l'ajouter au crédit laisserait à WHMCS un
+ * trop-perçu à reverser en avoir. Les frais inscrits sont ceux que le
+ * marchand supporte — la commission quand elle est retenue sur la somme,
+ * rien quand le client l'a réglée par-dessus.
+ */
+$fee = $settled['customer_fee'] > 0
+    ? 0.0
+    : (isset($payment['fee']) ? (float) $payment['fee'] : 0.0);
 
-addInvoicePayment($invoiceId, $transactionId, (float) $paidAmount, $fee, $gatewayModuleName);
+addInvoicePayment($invoiceId, $transactionId, (float) $settled['amount'], $fee, $gatewayModuleName);
 logTransaction($gatewayParams['name'], $payment, 'Successful');
 
 walleopay_cb_respond(200, 'processed', 'Paiement enregistré.');
@@ -293,6 +310,74 @@ function walleopay_cb_invoiceId($payment)
     }
 
     return 0;
+}
+
+/**
+ * Part du paiement qui règle la facture, ou null si elle ne correspond pas.
+ *
+ * Quand le client paie la commission, WalleoPay l'ajoute par-dessus le
+ * montant demandé : `amount` vaut alors la facture PLUS `fee`, et `net` la
+ * facture seule. Comparer `amount` à la facture échouait donc à coup sûr, et
+ * la facture n'était jamais créditée.
+ *
+ * L'API ne dit pas qui porte la commission : le module de passerelle glisse
+ * donc le montant qu'il demande dans les métadonnées (`requested_amount`).
+ * Présent, il doit valoir le total ou le solde de la facture, et le paiement
+ * doit en être l'une des deux formes — le montant seul, ou le montant plus la
+ * commission. Absent (paiement d'une version antérieure), les deux formes sont
+ * essayées sur le total et sur le solde. Un montant vraiment différent reste
+ * toujours refusé.
+ *
+ * Même règle que walleopay_settledAmount() dans le module de passerelle ; le
+ * fichier de rappel garde sa propre copie pour ne dépendre que de lui-même.
+ *
+ * @param array $payment
+ * @param array $expected Montants acceptables (total, solde), en francs entiers.
+ *
+ * @return array|null amount (réglé), customer_fee (commission payée par le
+ *                    client, 0 sinon)
+ */
+function walleopay_cb_settledAmount($payment, $expected)
+{
+    $amount = isset($payment['amount']) ? (int) $payment['amount'] : -1;
+    $fee = isset($payment['fee']) ? (int) $payment['fee'] : 0;
+    $candidates = array();
+
+    foreach ($expected as $candidate) {
+        $candidates[] = (int) $candidate;
+    }
+
+    if (isset($payment['metadata']['requested_amount'])) {
+        $requested = (int) $payment['metadata']['requested_amount'];
+
+        if (!in_array($requested, $candidates, true)) {
+            return null;
+        }
+
+        $candidates = array($requested);
+    }
+
+    foreach ($candidates as $candidate) {
+        if ($amount === $candidate) {
+            return array('amount' => $candidate, 'customer_fee' => 0);
+        }
+    }
+
+    if ($fee <= 0) {
+        return null;
+    }
+
+    foreach ($candidates as $candidate) {
+        // `net` est ce que le marchand touche : quand il est fourni, il doit
+        // tomber lui aussi sur le montant attendu.
+        if ($amount - $fee === $candidate
+            && (!isset($payment['net']) || (int) $payment['net'] === $candidate)
+        ) {
+            return array('amount' => $candidate, 'customer_fee' => $fee);
+        }
+    }
+
+    return null;
 }
 
 /**

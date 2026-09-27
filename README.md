@@ -45,14 +45,14 @@ l'installation WHMCS.
 
 | Champ | Description |
 |---|---|
-| **Mode** | `Test` utilise la clé `sk_test_…`, `Production` la clé `sk_live_…`. Le mode réel découle toujours de la clé envoyée. |
-| **Clé secrète de test** | Clé `sk_test_…` du tableau de bord WalleoPay. |
+| **Mode** | `Test` utilise la clé `sk_test_…`, `Production` la clé `sk_live_…`. Le mode effectivement appliqué découle toujours de la clé envoyée. Le test n'est pas une simulation : voir la section 8. |
+| **Clé secrète de test** | Clé `sk_test_…` du tableau de bord WalleoPay (**Applications → Clés API**). |
 | **Clé secrète de production** | Clé `sk_live_…` du tableau de bord WalleoPay. |
-| **Secret de webhook** | Secret `whsec_…` du tableau de bord WalleoPay. Sans lui, aucune notification n'est acceptée. |
+| **Secret de webhook** | Secret `whsec_…` du tableau de bord WalleoPay (**Applications → Notifications**). Un seul par compte, le même en test et en production. Sans lui, aucune notification n'est acceptée. |
 | **URL de base de l'API** | `https://walleopay.com/api/v1` par défaut. À ne changer que pour un environnement local (`http://127.0.0.1:8000/api/v1`). |
 | **Texte du bouton** | Libellé affiché au client, « Payer avec WalleoPay » par défaut. |
 | **Journalisation** | Active la trace des appels API dans **Utilities → Logs → Module Log**. La clé secrète y est masquée. |
-| **URL de rappel (webhook)** | Champ informatif : il affiche l'URL à coller côté WalleoPay. |
+| **URL de rappel (webhook)** | Champ informatif : il affiche l'adresse que le module transmet avec chaque paiement. Rien à copier côté WalleoPay. |
 
 Les clés secrètes ne doivent **jamais** être exposées côté navigateur ni
 communiquées par courriel : elles autorisent tous les appels API de votre compte
@@ -60,17 +60,21 @@ marchand.
 
 ## 4. URL de rappel (webhook)
 
-Dans votre tableau de bord WalleoPay, renseignez comme URL de notification :
+Le module transmet lui-même l'adresse du fichier de rappel avec chaque paiement
+(champ `notify_url`) :
 
 ```
 https://votre-whmcs.tld/modules/gateways/callback/walleopay.php
 ```
 
-Remplacez `https://votre-whmcs.tld/` par l'URL système exacte de votre WHMCS
-(**Setup → General Settings → General → WHMCS System URL**), barre oblique
-finale comprise avant `modules/`. Le module transmet également cette URL dans
-chaque paiement (`notify_url`), mais la valeur configurée côté WalleoPay reste
-la référence.
+Elle est construite à partir de l'URL système de votre WHMCS (**Setup → General
+Settings → General → WHMCS System URL**) : vérifiez que celle-ci est exacte, en
+HTTPS. **Cette adresse l'emporte** sur l'URL de notification par défaut réglée
+dans le tableau de bord WalleoPay (**Mon compte → Paramètres → URLs par
+défaut**) : il n'y a rien à y déclarer pour WHMCS. L'URL par défaut ne sert
+qu'aux paiements créés sans `notify_url` et aux notifications de remboursement
+et de reversement ; si elle pointe vers WHMCS, le fichier de rappel répond `200`
+et ignore ces dernières.
 
 L'URL doit être accessible publiquement en HTTPS, sans authentification HTTP,
 sans pare-feu applicatif bloquant les requêtes `POST` de WalleoPay.
@@ -92,7 +96,12 @@ Points d'attention :
 - Le montant doit être compris entre **100** et **1 000 000 XAF** ; en dehors de
   cet intervalle, le module affiche un message au lieu du bouton.
 - Le fichier de rappel refuse tout paiement dont le montant ou la devise ne
-  correspondent pas à la facture.
+  correspondent pas à la facture. Quand le client paie la commission (réglage
+  « Qui paie la commission » du compte ou du service), WalleoPay l'ajoute
+  par-dessus : le paiement porte sur la facture **plus** la commission, et c'est
+  `amount − fee` qui est comparé à la facture. Le module joint à chaque paiement
+  le montant qu'il demande (métadonnée `requested_amount`), qui doit valoir le
+  total ou le solde de la facture : aucun écart n'est deviné.
 
 ## 6. Comment la facture est créditée
 
@@ -104,8 +113,8 @@ Le fichier de rappel ne fait jamais confiance au seul webhook. Dans l'ordre :
    rejetée en `401`.
 3. **Re-interrogation de `GET /payments/{id}`** auprès de l'API : seul un statut
    `succeeded` renvoyé par l'API autorise la suite.
-4. Contrôle du montant (total ou solde de la facture, arrondi à l'entier) et de
-   la devise.
+4. Contrôle du montant (total ou solde de la facture, arrondi à l'entier, commission
+   payée par le client mise à part) et de la devise.
 5. `checkCbInvoiceID()`, `checkCbTransID()` (anti-doublon) puis
    `addInvoicePayment()` et `logTransaction()`.
 
@@ -113,11 +122,11 @@ Traitement des autres statuts :
 
 | Statut WalleoPay | Comportement |
 |---|---|
-| `succeeded` | Facture créditée, transaction journalisée « Successful ». |
+| `succeeded` | Facture créditée du montant qu'elle réclamait, transaction journalisée « Successful ». La commission est inscrite en frais quand elle est retenue sur la somme ; quand le client l'a payée par-dessus, elle ne l'est pas, et la facture n'est pas créditée d'un trop-perçu. |
 | `awaiting_confirmation` | Journalisation « Pending » uniquement. **Aucune facture créditée** : le rapprochement manuel est en cours côté WalleoPay. |
 | `failed`, `cancelled`, `expired` | Journalisation « Unsuccessful », aucun paiement ajouté. |
 | `pending`, `processing` | Réponse `409` pour que WalleoPay renvoie la notification plus tard. |
-| `payout.*` | Ignoré (ne concerne aucune facture). |
+| `payout.*`, `refund.*` | Ignorés, réponse `200` (ne concernent aucune facture). |
 
 Codes de réponse HTTP renvoyés à WalleoPay :
 
@@ -133,30 +142,53 @@ Codes de réponse HTTP renvoyés à WalleoPay :
 ## 7. Parcours client
 
 1. Le client ouvre sa facture et clique sur **Payer avec WalleoPay**.
-2. WHMCS appelle `POST /payments` avec la référence `invoice-<id>`, une clé
-   `Idempotency-Key` déterministe et les métadonnées
-   `{invoice_id, client_id, source: "whmcs"}`.
+2. WHMCS appelle `POST /payments` avec la référence `invoice-<id>`
+   (`invoice-<id>-test` en mode test), une clé `Idempotency-Key` propre à cette
+   tentative et les métadonnées
+   `{invoice_id, client_id, source: "whmcs", requested_amount}`.
 3. Le client est redirigé vers la page de paiement WalleoPay, choisit son moyen
    de paiement et valide (code PIN Mobile Money ou carte).
 4. Il revient sur la facture WHMCS (`return_url`), pendant que le webhook
    crédite la facture en arrière-plan.
 
-Si la facture est rouverte alors qu'un paiement est déjà en cours, le module
-réutilise le paiement existant au lieu d'en créer un second. Si le paiement
-précédent a échoué ou expiré, une nouvelle tentative est créée avec une
-référence dérivée (`invoice-12-a1b2c3d4`), toujours rattachée à la facture par
-les métadonnées.
+Le bouton est préparé à chaque affichage de la facture, et le module relit
+toujours l'état réel de la dernière tentative (`GET /payments/{référence}`)
+avant de le présenter :
+
+| Dernière tentative | Ce que voit le client |
+|---|---|
+| En cours (`pending`, `processing`), même montant | Le même bouton, vers la même page de paiement. |
+| `pending` mais le montant dû a changé | Elle est annulée, puis une nouvelle tentative est ouverte. |
+| `processing` mais le montant dû a changé | Un message d'attente : la demande est déjà sur le téléphone du client, on ne l'annule pas. |
+| `failed`, `cancelled`, `expired` | Une nouvelle tentative : `invoice-12-2`, puis `invoice-12-3`… |
+| `succeeded`, pas encore enregistrée dans WHMCS | « Cette facture a déjà été réglée » : aucun nouveau paiement. |
+| `succeeded` et déjà enregistrée (solde rouvert) | Une nouvelle tentative pour le solde. |
+| `awaiting_confirmation` | Un message : le rapprochement est en cours, aucun nouveau paiement. |
+
+Chaque tentative a sa propre clé d'idempotence : une page expirée (au bout de
+30 minutes) n'est jamais resservie, et deux affichages simultanés ne créent qu'un
+seul paiement. Une nouvelle tentative ne s'ouvre qu'une fois la précédente
+close : il n'y a jamais deux paiements payables à la fois pour une même facture.
+En production, les paiements créés par la version précédente sous
+`invoice-<id>` restent reconnus comme première tentative. En test, les
+références prennent désormais le suffixe `-test` : une référence étant unique
+pour tout le compte, test et production ne se disputent plus les mêmes numéros.
 
 ## 8. Test avant mise en production
 
-1. Mode **Test** + clé `sk_test_…`, secret de webhook de test.
-2. Créez une facture de 1 000 XAF sur un client de test.
+Le mode test **n'est pas une simulation** : il passe par un vrai canal de
+paiement, débite réellement le payeur et crédite votre solde WalleoPay,
+commission comprise. Seuls les clés, l'historique et les statistiques restent
+séparés de la production. Testez avec de petits montants.
+
+1. Mode **Test** + clé `sk_test_…`, et le secret de webhook du compte.
+2. Créez une petite facture (par exemple 100 XAF) sur un client de test.
 3. Payez-la depuis l'espace client ; vérifiez dans **Billing → Gateway Log**
    l'entrée « Successful » et le paiement rattaché à la facture.
-4. Basculez ensuite en **Production** et remplacez les clés.
+4. Basculez ensuite en **Production** et renseignez la clé `sk_live_…`.
 
-Les deux modes utilisent des clés et des secrets de webhook distincts : pensez à
-changer les deux lors de la bascule.
+Les deux modes ont des clés distinctes mais **un seul secret de webhook**,
+celui du compte : lors de la bascule, seule la clé change.
 
 ## 9. Dépannage
 
@@ -167,7 +199,8 @@ changer les deux lors de la bascule.
 | « Trop de tentatives de paiement » | Limite de 120 requêtes/minute par clé atteinte (HTTP 429). Le délai d'attente est indiqué dans le message. |
 | « La configuration WalleoPay de ce site est invalide » | Clé refusée (`authentication_error`) : clé de test utilisée en mode production, ou clé révoquée. |
 | Compte non validé / service non approuvé | `kyc_not_approved` ou `service_not_approved` : finalisez la validation dans le tableau de bord WalleoPay. |
-| La facture reste impayée malgré un paiement réussi | Vérifiez **Billing → Gateway Log** : `401` = mauvais secret de webhook, `400 amount_mismatch` = montant ou devise divergents, aucune entrée = URL de rappel non renseignée ou inaccessible. |
+| La facture reste impayée malgré un paiement réussi | Vérifiez **Billing → Gateway Log** : `401` = mauvais secret de webhook, `400 amount_mismatch` = montant ou devise divergents, aucune entrée = URL de rappel inaccessible (URL système WHMCS erronée, pare-feu, authentification HTTP). Une fois la cause corrigée, rejouez la notification depuis **Applications → Notifications** du tableau de bord WalleoPay. |
+| « Cette facture a déjà été réglée via WalleoPay » alors qu'elle reste impayée | Un paiement a réussi mais WHMCS ne l'a pas encore crédité : le module refuse d'en ouvrir un second. Réglez la notification (ligne précédente) plutôt que de faire repayer le client. |
 | Paiement « en attente de confirmation » | Statut `awaiting_confirmation` : le client a payé au code marchand, le rapprochement est manuel. La facture sera créditée à la notification suivante. |
 
 Journaux utiles :
@@ -179,11 +212,13 @@ Journaux utiles :
 
 ## 10. Remboursements
 
-Le module ne déclare pas de fonction `walleopay_refund()` : WalleoPay propose
-l'annulation d'un paiement non finalisé, pas le remboursement d'un paiement
-abouti. WHMCS n'affiche donc pas de bouton *Refund* pour cette passerelle. Les
-remboursements se traitent depuis le tableau de bord WalleoPay, puis se
-constatent manuellement dans WHMCS.
+WalleoPay sait rembourser un paiement abouti, en tout ou en partie : depuis la
+fiche du paiement dans le tableau de bord (**Mes ventes → Paiements**, réservé au
+propriétaire du compte, suivi dans **Mes ventes → Remboursements**) ou par l'API
+(`POST /payments/{id}/refunds`). Ce module ne déclare
+cependant pas de fonction `walleopay_refund()` : WHMCS n'affiche donc pas de
+bouton *Refund* pour cette passerelle. Remboursez depuis le tableau de bord
+WalleoPay, puis constatez le remboursement à la main dans WHMCS.
 
 ---
 

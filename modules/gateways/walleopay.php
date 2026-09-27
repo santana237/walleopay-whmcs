@@ -29,6 +29,28 @@ if (!defined('WALLEOPAY_DEFAULT_API')) {
     define('WALLEOPAY_DEFAULT_API', 'https://walleopay.com/api/v1');
 }
 
+if (!defined('WALLEOPAY_MAX_ATTEMPT')) {
+    /**
+     * Numéro de tentative le plus élevé qu'une facture puisse atteindre.
+     *
+     * Une tentative ne s'ouvre qu'après la clôture de la précédente : il
+     * faudrait des centaines de pages laissées expirer pour s'en approcher.
+     * Au-delà, le module s'arrête plutôt que de sonder l'API sans fin.
+     */
+    define('WALLEOPAY_MAX_ATTEMPT', 999);
+}
+
+if (!defined('WALLEOPAY_MAX_STEPS')) {
+    /**
+     * Pas en avant autorisés pendant un seul affichage de la facture.
+     *
+     * Le cas courant en demande un ou deux. Les autres ne servent qu'à
+     * enjamber un numéro déjà pris ailleurs, et l'on préfère un message
+     * clair à une rafale d'appels qui buterait sur la limite de débit.
+     */
+    define('WALLEOPAY_MAX_STEPS', 10);
+}
+
 /**
  * Métadonnées du module.
  *
@@ -66,7 +88,7 @@ function walleopay_config()
                 'live' => 'Production (clé sk_live_…)',
             ),
             'Default' => 'test',
-            'Description' => 'Le mode découle de la clé utilisée. En test, aucun argent réel ne circule.',
+            'Description' => 'Le mode découle de la clé utilisée. Le test n\'est pas une simulation : il débite réellement le client et crédite votre solde WalleoPay, commission comprise. Faites vos essais avec de petits montants.',
         ),
         'testSecretKey' => array(
             'FriendlyName' => 'Clé secrète de test',
@@ -84,7 +106,7 @@ function walleopay_config()
             'FriendlyName' => 'Secret de webhook',
             'Type' => 'password',
             'Size' => '60',
-            'Description' => 'Secret « whsec_… » affiché dans votre tableau de bord WalleoPay. Il sert à vérifier la signature des notifications.',
+            'Description' => 'Secret « whsec_… » affiché dans votre tableau de bord WalleoPay, rubrique Notifications. Il sert à vérifier la signature des notifications. Un seul secret par compte : le même en test et en production.',
         ),
         'apiBaseUrl' => array(
             'FriendlyName' => 'URL de base de l\'API',
@@ -110,7 +132,7 @@ function walleopay_config()
             'Type' => 'text',
             'Size' => '80',
             'Default' => $callbackUrl,
-            'Description' => 'Copiez cette URL dans votre tableau de bord WalleoPay (champ « URL de notification »). Champ informatif : sa valeur n\'est pas utilisée par le module.',
+            'Description' => 'Adresse que le module transmet avec chaque paiement : WalleoPay y envoie les notifications de paiement, quelle que soit l\'URL de notification par défaut de votre tableau de bord. Rien à copier. Champ informatif : sa valeur n\'est pas utilisée par le module.',
         ),
     );
 }
@@ -151,68 +173,407 @@ function walleopay_link($params)
         return walleopay_notice('Le montant maximum accepté par WalleoPay est de 1 000 000 F CFA.');
     }
 
-    $reference = walleopay_reference($params);
-    $payload = walleopay_paymentPayload($params, $reference, $amount, $currency);
+    $attempt = walleopay_openAttempt($params, $amount, $currency);
 
-    $response = walleopay_apiRequest(
-        $params,
-        'POST',
-        '/payments',
-        $payload,
-        walleopay_idempotencyKey($params, $reference, $amount, $currency)
-    );
+    switch ($attempt['state']) {
+        case 'open':
+            return walleopay_button($attempt['checkout_url'], $buttonText);
 
-    if ($response['ok'] && !empty($response['data']['checkout_url'])) {
-        return walleopay_button($response['data']['checkout_url'], $buttonText);
+        case 'paid':
+            return walleopay_notice('Cette facture a déjà été réglée via WalleoPay. Actualisez la page dans quelques instants.');
+
+        case 'awaiting':
+            return walleopay_notice('Un paiement WalleoPay est en cours de rapprochement pour cette facture. Aucun nouveau paiement n\'est nécessaire.');
+
+        case 'busy':
+            return walleopay_notice('Un paiement WalleoPay est en cours de validation pour cette facture. Actualisez la page dans quelques minutes.');
+
+        case 'exhausted':
+            return walleopay_notice('Trop de tentatives de paiement pour cette facture. Contactez-nous pour la régler.');
     }
 
-    // Une facture consultée plusieurs fois réutilise la même référence :
-    // on récupère le paiement déjà ouvert plutôt que d'en créer un second.
-    if ($response['ok'] === false && walleopay_isDuplicateReference($response)) {
-        $existing = walleopay_apiRequest($params, 'GET', '/payments/' . rawurlencode($reference));
+    return walleopay_notice(walleopay_errorMessage($attempt['response'], $invoiceId));
+}
 
-        if ($existing['ok']) {
-            $data = $existing['data'];
-            $status = isset($data['status']) ? (string) $data['status'] : '';
+/**
+ * Trouve — ou ouvre — la tentative de paiement à présenter pour la facture.
+ *
+ * Une facture connaît parfois plusieurs paiements : la page de paiement
+ * expire au bout de 30 minutes, un solde est insuffisant, le montant dû
+ * change. Chaque paiement porte donc un numéro de tentative dans sa
+ * référence (« invoice-42 », puis « invoice-42-2 », « invoice-42-3 »…), et sa
+ * clé d'idempotence en découle.
+ *
+ * Autrefois, la clé ne dépendait que de la facture et du montant : rouverte
+ * après expiration, la facture recevait de l'API la réponse d'origine,
+ * rejouée telle quelle, et le bouton menait à une page morte. Deux règles
+ * tiennent désormais l'ensemble :
+ *
+ *   - un numéro ne s'ouvre qu'une fois le précédent clos (échoué, annulé,
+ *     expiré, ou réussi ET déjà enregistré dans WHMCS) : il n'existe jamais
+ *     deux paiements payables à la fois pour une facture, et un paiement
+ *     réussi que WHMCS n'a pas encore crédité bloque toute nouvelle
+ *     demande ;
+ *   - une tentative est toujours relue par GET avant d'être présentée : une
+ *     réponse rejouée décrit le paiement à sa création, pas tel qu'il est.
+ *
+ * @param array         $params
+ * @param int           $amount   Montant dû, en francs entiers.
+ * @param string        $currency
+ * @param callable|null $request  Appel à l'API, remplaçable pour les tests.
+ * @param callable|null $recorded Paiement déjà enregistré dans WHMCS ? Idem.
+ *
+ * @return array state : open (avec checkout_url), paid, awaiting, busy,
+ *               exhausted ou error (avec response)
+ */
+function walleopay_openAttempt($params, $amount, $currency, $request = null, $recorded = null)
+{
+    $request = $request !== null ? $request : 'walleopay_apiRequest';
+    $recorded = $recorded !== null ? $recorded : 'walleopay_transactionRecorded';
+    $base = walleopay_reference($params);
 
-            if ($status === 'succeeded') {
-                return walleopay_notice('Cette facture a déjà été réglée via WalleoPay. Actualisez la page dans quelques instants.');
-            }
+    $last = walleopay_lastAttempt($params, $base, $request);
 
-            if ($status === 'awaiting_confirmation') {
-                return walleopay_notice('Un paiement WalleoPay est en cours de rapprochement pour cette facture. Aucun nouveau paiement n\'est nécessaire.');
-            }
+    if (isset($last['error'])) {
+        return array('state' => 'error', 'response' => $last['error']);
+    }
 
-            $sameAmount = isset($data['amount']) && (int) $data['amount'] === $amount;
-            $sameCurrency = isset($data['currency']) && strtoupper((string) $data['currency']) === $currency;
+    $number = $last['number'];
+    $payment = $last['payment'];
 
-            if (in_array($status, array('pending', 'processing'), true)
-                && $sameAmount && $sameCurrency && !empty($data['checkout_url'])
-            ) {
-                return walleopay_button($data['checkout_url'], $buttonText);
+    for ($step = 0; $step < WALLEOPAY_MAX_STEPS; $step++) {
+        if ($payment !== null) {
+            $outcome = walleopay_evaluateAttempt($params, $payment, $amount, $currency, $request, $recorded);
+
+            if ($outcome['state'] !== 'closed') {
+                return $outcome;
             }
         }
 
-        // Paiement précédent échoué/expiré, ou montant modifié : nouvelle tentative
-        // avec une référence dérivée, toujours rattachée à la facture par les métadonnées.
-        $payload['reference'] = substr($reference . '-' . substr(md5(uniqid('walleopay', true)), 0, 8), 0, 120);
+        $number++;
 
-        $retry = walleopay_apiRequest(
+        if ($number > WALLEOPAY_MAX_ATTEMPT) {
+            return array('state' => 'exhausted');
+        }
+
+        $reference = walleopay_attemptReference($base, $number);
+        $created = call_user_func(
+            $request,
             $params,
             'POST',
             '/payments',
-            $payload,
-            walleopay_idempotencyKey($params, $payload['reference'], $amount, $currency)
+            walleopay_paymentPayload($params, $reference, $amount, $currency),
+            walleopay_idempotencyKey($params, $reference, $amount, $currency)
         );
 
-        if ($retry['ok'] && !empty($retry['data']['checkout_url'])) {
-            return walleopay_button($retry['data']['checkout_url'], $buttonText);
+        if ($created['ok'] && empty($created['replayed'])) {
+            // Réponse fraîche : elle dit l'état réel du paiement qui vient
+            // de naître, on l'examine au tour suivant sans la relire.
+            $payment = $created['data'];
+            continue;
         }
 
-        $response = $retry;
+        if (!$created['ok'] && !walleopay_isDuplicateReference($created)) {
+            return array('state' => 'error', 'response' => $created);
+        }
+
+        // Réponse rejouée, ou numéro déjà pris : seul un GET dit où en est
+        // réellement ce paiement.
+        $lookup = walleopay_lookupAttempt($params, $base, $number, $request);
+
+        if ($lookup['ok']) {
+            $payment = $lookup['data'];
+            continue;
+        }
+
+        if ((int) $lookup['status'] !== 404) {
+            return array('state' => 'error', 'response' => $lookup);
+        }
+
+        // Numéro pris hors de ce mode — une référence est unique pour tout le
+        // compte, test et production confondus — ou jamais créé : on
+        // l'enjambe.
+        $payment = null;
     }
 
-    return walleopay_notice(walleopay_errorMessage($response, $invoiceId));
+    return array('state' => 'exhausted');
+}
+
+/**
+ * Dernière tentative existante de la facture : numéro (0 si aucune) et
+ * paiement correspondant.
+ *
+ * Les numéros s'ouvrent l'un après l'autre et forment une suite continue :
+ * une recherche exponentielle puis dichotomique trouve le dernier en
+ * quelques appels, même après des dizaines de pages laissées expirer. Les
+ * sonder un à un finirait par buter sur la limite de 120 requêtes par
+ * minute et par clé.
+ *
+ * @param array    $params
+ * @param string   $base
+ * @param callable $request
+ *
+ * @return array number + payment, ou error (réponse API en échec)
+ */
+function walleopay_lastAttempt($params, $base, $request)
+{
+    $found = 0;
+    $payment = null;
+    $missing = 0;
+    $probe = 1;
+
+    while ($missing === 0) {
+        $lookup = walleopay_lookupAttempt($params, $base, $probe, $request);
+
+        if ($lookup['ok']) {
+            $found = $probe;
+            $payment = $lookup['data'];
+
+            if ($probe >= WALLEOPAY_MAX_ATTEMPT) {
+                break;
+            }
+
+            $probe = min($probe * 2, WALLEOPAY_MAX_ATTEMPT);
+            continue;
+        }
+
+        if ((int) $lookup['status'] !== 404) {
+            return array('error' => $lookup);
+        }
+
+        // La première référence est la seule qu'une ancienne version du
+        // module ait pu prendre dans l'autre mode : absente ici, elle ne
+        // prouve pas que la suite est vide.
+        if ($probe === 1) {
+            $next = walleopay_lookupAttempt($params, $base, 2, $request);
+
+            if ($next['ok']) {
+                $found = 2;
+                $payment = $next['data'];
+                $probe = 4;
+                continue;
+            }
+
+            if ((int) $next['status'] !== 404) {
+                return array('error' => $next);
+            }
+        }
+
+        $missing = $probe;
+    }
+
+    while ($missing - $found > 1) {
+        $middle = intdiv($found + $missing, 2);
+        $lookup = walleopay_lookupAttempt($params, $base, $middle, $request);
+
+        if ($lookup['ok']) {
+            $found = $middle;
+            $payment = $lookup['data'];
+        } elseif ((int) $lookup['status'] === 404) {
+            $missing = $middle;
+        } else {
+            return array('error' => $lookup);
+        }
+    }
+
+    return array('number' => $found, 'payment' => $payment);
+}
+
+/**
+ * GET d'une tentative par sa référence.
+ *
+ * @param array    $params
+ * @param string   $base
+ * @param int      $number
+ * @param callable $request
+ *
+ * @return array Réponse normalisée de walleopay_apiRequest()
+ */
+function walleopay_lookupAttempt($params, $base, $number, $request)
+{
+    return call_user_func(
+        $request,
+        $params,
+        'GET',
+        '/payments/' . rawurlencode(walleopay_attemptReference($base, $number))
+    );
+}
+
+/**
+ * Ce que l'on peut faire d'une tentative existante.
+ *
+ * @param array    $params
+ * @param array    $payment  Paiement tel que relu auprès de l'API.
+ * @param int      $amount
+ * @param string   $currency
+ * @param callable $request
+ * @param callable $recorded
+ *
+ * @return array state : closed (on peut en ouvrir une autre), open, paid,
+ *               awaiting, busy ou error
+ */
+function walleopay_evaluateAttempt($params, $payment, $amount, $currency, $request, $recorded)
+{
+    $status = isset($payment['status']) ? (string) $payment['status'] : '';
+    $paymentId = isset($payment['id']) ? (string) $payment['id'] : '';
+
+    if ($status === 'succeeded') {
+        // Déjà crédité : ce qui reste dû est une nouvelle dette. Pas encore
+        // crédité (notification en route, ou refusée) : un second paiement
+        // ferait payer le client deux fois.
+        return call_user_func($recorded, $paymentId)
+            ? array('state' => 'closed')
+            : array('state' => 'paid');
+    }
+
+    if ($status === 'awaiting_confirmation') {
+        return array('state' => 'awaiting');
+    }
+
+    if (in_array($status, array('failed', 'cancelled', 'expired'), true)) {
+        return array('state' => 'closed');
+    }
+
+    // Statut inconnu : on n'ouvre rien à côté d'un paiement qu'on ne sait
+    // pas lire.
+    if (!in_array($status, array('pending', 'processing'), true)) {
+        return array('state' => 'busy');
+    }
+
+    $sameAmount = walleopay_settledAmount($payment, array($amount)) !== null;
+    $sameCurrency = isset($payment['currency']) && strtoupper((string) $payment['currency']) === $currency;
+
+    if ($sameAmount && $sameCurrency) {
+        // Même demande : on la reprend. Sans page à montrer, on attend
+        // plutôt que d'annuler un paiement qui n'a rien de périmé.
+        return !empty($payment['checkout_url'])
+            ? array('state' => 'open', 'checkout_url' => (string) $payment['checkout_url'])
+            : array('state' => 'busy');
+    }
+
+    // Le montant dû a changé pendant que la page restait ouverte. Une
+    // demande déjà partie vers le téléphone du client ne s'annule pas sans
+    // risque : l'opérateur pourrait débiter un paiement que l'on croit mort.
+    if ($status === 'processing' || $paymentId === '') {
+        return array('state' => 'busy');
+    }
+
+    $cancel = call_user_func(
+        $request,
+        $params,
+        'POST',
+        '/payments/' . rawurlencode($paymentId) . '/cancel',
+        array()
+    );
+
+    if (!$cancel['ok']) {
+        return array('state' => 'error', 'response' => $cancel);
+    }
+
+    $after = isset($cancel['data']['status']) ? (string) $cancel['data']['status'] : '';
+
+    // Annulation sans effet : on ne superpose pas une seconde page à la
+    // première.
+    if ($after === '' || $after === 'pending' || $after === 'processing') {
+        return array('state' => 'busy');
+    }
+
+    // Le paiement a pu aboutir juste avant l'annulation : on le relit comme
+    // les autres, sans jamais rappeler l'annulation.
+    return walleopay_evaluateAttempt($params, $cancel['data'], $amount, $currency, $request, $recorded);
+}
+
+/**
+ * Part d'un paiement qui règle le montant attendu, ou null.
+ *
+ * Quand le client paie la commission, WalleoPay l'ajoute par-dessus le
+ * montant demandé : `amount` vaut alors la facture PLUS `fee`, et `net` la
+ * facture seule. Comparer `amount` à la facture échouait donc à tous les
+ * coups.
+ *
+ * L'API ne dit pas qui porte la commission. Pour ne pas deviner, le module
+ * glisse le montant qu'il demande dans les métadonnées (`requested_amount`) :
+ * il doit être l'un des montants attendus, et le paiement doit en être l'une
+ * des deux formes — le montant seul, ou le montant plus la commission. Sans
+ * cette donnée (paiement créé par une version antérieure), les deux formes
+ * sont essayées sur chaque montant attendu. Dans tous les cas, un montant
+ * vraiment différent ne correspond jamais.
+ *
+ * Même règle dans le fichier de rappel (walleopay_cb_settledAmount()).
+ *
+ * @param array $payment
+ * @param array $expected Montants acceptables, en francs entiers.
+ *
+ * @return array|null amount (réglé), customer_fee (commission payée par le
+ *                    client, 0 sinon)
+ */
+function walleopay_settledAmount($payment, $expected)
+{
+    $amount = isset($payment['amount']) ? (int) $payment['amount'] : -1;
+    $fee = isset($payment['fee']) ? (int) $payment['fee'] : 0;
+    $candidates = array();
+
+    foreach ($expected as $candidate) {
+        $candidates[] = (int) $candidate;
+    }
+
+    if (isset($payment['metadata']['requested_amount'])) {
+        $requested = (int) $payment['metadata']['requested_amount'];
+
+        if (!in_array($requested, $candidates, true)) {
+            return null;
+        }
+
+        $candidates = array($requested);
+    }
+
+    foreach ($candidates as $candidate) {
+        if ($amount === $candidate) {
+            return array('amount' => $candidate, 'customer_fee' => 0);
+        }
+    }
+
+    if ($fee <= 0) {
+        return null;
+    }
+
+    foreach ($candidates as $candidate) {
+        // `net` est ce que le marchand touche : quand il est fourni, il doit
+        // tomber lui aussi sur le montant attendu.
+        if ($amount - $fee === $candidate
+            && (!isset($payment['net']) || (int) $payment['net'] === $candidate)
+        ) {
+            return array('amount' => $candidate, 'customer_fee' => $fee);
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Ce paiement WalleoPay figure-t-il déjà parmi les transactions WHMCS ?
+ *
+ * En cas de doute (base illisible), la réponse est non : on préfère
+ * demander au client d'actualiser la page que risquer de le faire payer deux
+ * fois.
+ *
+ * @param string $paymentId
+ *
+ * @return bool
+ */
+function walleopay_transactionRecorded($paymentId)
+{
+    if ($paymentId === '' || !class_exists('\\Illuminate\\Database\\Capsule\\Manager')) {
+        return false;
+    }
+
+    try {
+        return \Illuminate\Database\Capsule\Manager::table('tblaccounts')
+            ->where('transid', $paymentId)
+            ->exists();
+    } catch (\Throwable $e) {
+        return false;
+    }
 }
 
 /**
@@ -266,6 +627,10 @@ function walleopay_paymentPayload($params, $reference, $amount, $currency)
             'invoice_id' => (string) ((int) $params['invoiceid']),
             'client_id' => (string) (isset($client['userid']) ? (int) $client['userid'] : 0),
             'source' => 'whmcs',
+            // Le montant demandé, tel quel : quand le client paie la
+            // commission, `amount` la contient, et seul ce chiffre dit sans
+            // ambiguïté ce que la facture réclamait (walleopay_settledAmount()).
+            'requested_amount' => (int) $amount,
         ),
     );
 
@@ -285,7 +650,13 @@ function walleopay_paymentPayload($params, $reference, $amount, $currency)
 }
 
 /**
- * Référence marchand stable pour une facture : « invoice-<id> ».
+ * Racine des références d'une facture : « invoice-<id> » en production,
+ * « invoice-<id>-test » en test.
+ *
+ * Une référence est unique pour tout le compte WalleoPay, test et
+ * production confondus, alors qu'une clé ne voit que les paiements de son
+ * mode. Sans cette distinction, une facture ouverte pendant les essais
+ * aurait laissé en production des numéros déjà pris et invisibles.
  *
  * @param array $params
  *
@@ -293,12 +664,34 @@ function walleopay_paymentPayload($params, $reference, $amount, $currency)
  */
 function walleopay_reference($params)
 {
-    return 'invoice-' . (int) $params['invoiceid'];
+    $base = 'invoice-' . (int) $params['invoiceid'];
+
+    return walleopay_mode($params) === 'live' ? $base : $base . '-test';
 }
 
 /**
- * Clé d'idempotence déterministe : deux affichages identiques de la même
- * facture ne créent qu'un seul paiement.
+ * Référence de la tentative n° $number : la racine seule pour la première,
+ * suivie de « -<n> » ensuite (« invoice-42 », « invoice-42-2 »…).
+ *
+ * La première garde la forme historique : les paiements créés par les
+ * versions précédentes du module restent reconnus.
+ *
+ * @param string $base
+ * @param int    $number
+ *
+ * @return string
+ */
+function walleopay_attemptReference($base, $number)
+{
+    return (int) $number <= 1 ? $base : $base . '-' . (int) $number;
+}
+
+/**
+ * Clé d'idempotence déterministe d'une tentative.
+ *
+ * Elle porte la référence, donc le numéro de tentative : deux affichages
+ * simultanés de la facture ne créent qu'un paiement, mais une tentative
+ * close n'est jamais rejouée — la suivante a sa propre clé.
  *
  * @param array  $params
  * @param string $reference
@@ -328,6 +721,8 @@ function walleopay_idempotencyKey($params, $reference, $amount, $currency)
  *   error       array type/message normalisés en cas d'échec API
  *   network     string message d'erreur cURL le cas échéant
  *   retry_after int   secondes à attendre en cas de 429
+ *   replayed    bool  réponse d'idempotence rejouée (en-tête Idempotent-Replay) :
+ *                     elle décrit le paiement à sa création, pas son état actuel
  *
  * @param array       $params
  * @param string      $method
@@ -346,6 +741,7 @@ function walleopay_apiRequest($params, $method, $path, $body = null, $idempotenc
         'error' => array('type' => '', 'message' => ''),
         'network' => '',
         'retry_after' => 0,
+        'replayed' => false,
     );
 
     if (!function_exists('curl_init')) {
@@ -420,6 +816,8 @@ function walleopay_apiRequest($params, $method, $path, $body = null, $idempotenc
     if ($result['status'] === 429) {
         $result['retry_after'] = walleopay_headerValue($rawHeaders, 'retry-after');
     }
+
+    $result['replayed'] = strtolower(walleopay_headerText($rawHeaders, 'idempotent-replay')) === 'true';
 
     if ($result['status'] >= 200 && $result['status'] < 300) {
         $result['ok'] = true;
@@ -576,7 +974,7 @@ function walleopay_log($params, $action, $request, $response, $processed, $secre
 }
 
 /**
- * Lit un en-tête dans une réponse HTTP brute.
+ * Lit un en-tête numérique dans une réponse HTTP brute.
  *
  * @param string $rawHeaders
  * @param string $name
@@ -585,16 +983,29 @@ function walleopay_log($params, $action, $request, $response, $processed, $secre
  */
 function walleopay_headerValue($rawHeaders, $name)
 {
+    return (int) walleopay_headerText($rawHeaders, $name);
+}
+
+/**
+ * Lit un en-tête dans une réponse HTTP brute, chaîne vide s'il est absent.
+ *
+ * @param string $rawHeaders
+ * @param string $name
+ *
+ * @return string
+ */
+function walleopay_headerText($rawHeaders, $name)
+{
     $lines = preg_split('/\r?\n/', (string) $rawHeaders);
 
     foreach ($lines as $line) {
         $parts = explode(':', $line, 2);
         if (count($parts) === 2 && strtolower(trim($parts[0])) === strtolower($name)) {
-            return (int) trim($parts[1]);
+            return trim($parts[1]);
         }
     }
 
-    return 0;
+    return '';
 }
 
 /**
@@ -662,7 +1073,10 @@ function walleopay_systemUrl($params)
 }
 
 /**
- * URL exacte à coller dans le tableau de bord WalleoPay.
+ * Adresse du fichier de rappel, affichée dans les réglages pour vérification.
+ *
+ * Le module transmet la même avec chaque paiement (notify_url), et c'est elle
+ * que WalleoPay appelle : rien n'est à recopier dans le tableau de bord.
  *
  * @return string
  */
